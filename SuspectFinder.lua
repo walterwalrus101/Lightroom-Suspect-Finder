@@ -132,7 +132,8 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
                 #suspects, #suspects == 1 and '' or 's'),
         }
 
-        local written = 0
+        local written         = 0
+        local collectionMade  = false
 
         catalog:withWriteAccessDo('Suspect Finder: flag keyword-suspect', function()
             -- Create (or find) the keyword once, then apply to all suspects
@@ -151,20 +152,48 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
                 photo:addKeyword(kwObj)
                 written = written + 1
             end
+
+            -- ── Smart Collection Set + Smart Collection ────────────────────────
+            -- createCollectionSet(name, parent, returnExisting)
+            local collSet = catalog:createCollectionSet(
+                'Suspect Finder', nil, true)
+
+            -- createSmartCollection(name, searchDesc, parent, returnExisting)
+            if collSet then
+                catalog:createSmartCollection(
+                    'Needs Re-Keywording',
+                    {
+                        combine = 'intersect',
+                        {
+                            criteria  = 'keywords',
+                            operation = 'words',
+                            value     = 'keyword-suspect',
+                            value2    = '',
+                        },
+                    },
+                    collSet,
+                    true)   -- return existing if already present
+                collectionMade = true
+            end
         end)
 
         writeProgress:done()
 
         -- ── Done ──────────────────────────────────────────────────────────────
+        local collectionNote = collectionMade
+            and '\n\nA Smart Collection  "Suspect Finder → Needs Re-Keywording"\nhas been created in the Collections panel.'
+            or  '\n\n(Smart collection could not be created — flag photos manually.)'
+
         LrDialogs.message('Suspect Finder — Done',
             string.format(
-                '%d photo%s flagged with  "keyword-suspect".\n\n'
+                '%d photo%s flagged with  "keyword-suspect".%s\n\n'
              .. 'Next steps:\n'
-             .. '  1.  Library → open Keyword List, click "keyword-suspect"\n'
-             .. '      (or use the Filter bar: Keyword Contains "keyword-suspect")\n'
+             .. '  1.  Open the  "Suspect Finder → Needs Re-Keywording"\n'
+             .. '      smart collection in the Collections panel\n'
              .. '  2.  Select All  (Ctrl+A / Cmd+A)\n'
-             .. '  3.  Run  Library → Keyworder Supreme → Re-Keyword Selected Photos',
-                written, written == 1 and '' or 's'),
+             .. '  3.  Run  Library → Re-Keyword Selected Photos (Erase & Rebuild)',
+                written, written == 1 and '' or 's',
+                collectionNote),
             'info')
 
     end)  -- end startAsyncTask
