@@ -4,18 +4,20 @@
   Scans the entire catalog and flags photos that likely received incorrect
   keywords copied from a different file that happened to share the same name.
 
-  A photo is a "suspect" when its filename (case-insensitive) appears on 2 or
-  more photos in the catalog AND at least ONE of these is true:
+  A photo is a "suspect" when BOTH conditions are true:
+    1.  Its filename (case-insensitive) appears on 2 or more photos in the
+        catalog — i.e. there is at least one other file with the same name.
+    2.  The group contains photos with different capture dates — meaning these
+        are genuinely different images that share a filename by coincidence and
+        may have had each other's keywords applied incorrectly.
 
-    A.  The group contains photos with different capture dates — i.e. these are
-        genuinely different images that were keyworded as if they were the same.
-    B.  The photo's long side is under LONG_SIDE_THRESHOLD pixels — i.e. it is
-        a lower-res copy that may have inherited keywords from the high-res original.
+  ALL photos in a mixed-date group are flagged (not just the lower-res ones),
+  because any of them could be carrying the wrong keywords.
 
   Flagged photos get the keyword "keyword-suspect".
   A Smart Collection "Suspect Finder → Needs Re-Keywording" is created
   automatically so you can select all suspects in one click and send them to
-  Keyworder Supreme.
+  Keyworder Supreme for a clean re-key.
 --]]
 
 local LrApplication     = import 'LrApplication'
@@ -24,27 +26,15 @@ local LrFunctionContext = import 'LrFunctionContext'
 local LrProgressScope   = import 'LrProgressScope'
 local LrTasks           = import 'LrTasks'
 
--- ── Config ────────────────────────────────────────────────────────────────────
-local LONG_SIDE_THRESHOLD = 3000   -- pixels — lower-res copies below this are suspects
-
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
--- Returns the long side in pixels (respecting rotation).
-local function longSide(photo)
-    local w = photo:getRawMetadata('width')  or 0
-    local h = photo:getRawMetadata('height') or 0
-    local o = photo:getRawMetadata('orientation') or ''
-    if o == 'BC' or o == 'DA' then w, h = h, w end
-    return math.max(w, h)
-end
-
--- Returns capture date as a number (seconds), or nil if unavailable.
--- Truncated to whole-day granularity so minor time-stamp differences
--- between edited copies don't cause false positives.
+-- Returns capture date truncated to whole-day granularity, or nil.
+-- Day-level avoids false positives from edited copies with slightly
+-- different timestamps.
 local function captureDay(photo)
     local dt = photo:getRawMetadata('dateTimeOriginal')
     if type(dt) == 'number' and dt > 0 then
-        return math.floor(dt / 86400)   -- day-level granularity
+        return math.floor(dt / 86400)
     end
     return nil
 end
@@ -71,8 +61,8 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
             return
         end
 
-        -- ── Step 2: group by filename, collecting date + size per photo ────────
-        local byFilename = {}   -- filename (lower) → { { photo, day, ls }, … }
+        -- ── Step 2: group by filename, collecting capture date per photo ───────
+        local byFilename = {}   -- filename (lower) → { { photo, day }, … }
 
         for i, photo in ipairs(allPhotos) do
             if scanProgress:isCanceled() then
@@ -92,23 +82,20 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
                 table.insert(byFilename[fname], {
                     photo = photo,
                     day   = captureDay(photo),
-                    ls    = longSide(photo),
                 })
             end
         end
 
         -- ── Step 3: collect suspects ───────────────────────────────────────────
-        local suspects      = {}
-        local suspectSet    = {}   -- dedup by photo object
-        local dupFilenames  = 0
-        local reasonDate    = 0
-        local reasonSize    = 0
+        -- Flag every photo in a group where the capture dates are not all the same.
+        local suspects     = {}
+        local dupFilenames = 0   -- groups with 2+ photos
+        local mixedGroups  = 0   -- groups that have mixed dates
 
         for _, group in pairs(byFilename) do
             if #group > 1 then
                 dupFilenames = dupFilenames + 1
 
-                -- Check whether this group has mixed capture dates
                 local firstDay   = group[1].day
                 local mixedDates = false
                 for j = 2, #group do
@@ -117,15 +104,10 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
                     end
                 end
 
-                for _, entry in ipairs(group) do
-                    local isLowRes   = entry.ls > 0 and entry.ls < LONG_SIDE_THRESHOLD
-                    local isSuspect  = mixedDates or isLowRes
-
-                    if isSuspect and not suspectSet[entry.photo] then
-                        suspectSet[entry.photo] = true
+                if mixedDates then
+                    mixedGroups = mixedGroups + 1
+                    for _, entry in ipairs(group) do
                         table.insert(suspects, entry.photo)
-                        if mixedDates then reasonDate = reasonDate + 1 end
-                        if isLowRes   then reasonSize = reasonSize + 1 end
                     end
                 end
             end
@@ -138,37 +120,24 @@ LrFunctionContext.callWithContext('SuspectFinder', function(_ctx)
             LrDialogs.message('Suspect Finder',
                 string.format(
                     'No suspects found.\n\n'
-                 .. 'Scanned %d photos across %d duplicate filename group%s.\n'
-                 .. 'All duplicates have matching dates and long side ≥ %d px.',
+                 .. 'Scanned %d photos; %d filename group%s had duplicate names,\n'
+                 .. 'but all duplicates share the same capture date.',
                     total,
-                    dupFilenames, dupFilenames == 1 and '' or 's',
-                    LONG_SIDE_THRESHOLD),
+                    dupFilenames, dupFilenames == 1 and '' or 's'),
                 'info')
             return
-        end
-
-        -- Build a reason breakdown string
-        local reasons = {}
-        if reasonDate > 0 then
-            reasons[#reasons+1] = string.format(
-                '  • %d flagged because their filename group contains mixed capture dates',
-                reasonDate)
-        end
-        if reasonSize > 0 then
-            reasons[#reasons+1] = string.format(
-                '  • %d flagged because their long side is under %d px (lower-res copy)',
-                reasonSize, LONG_SIDE_THRESHOLD)
         end
 
         local confirmed = LrDialogs.confirm(
             'Suspect Finder',
             string.format(
-                'Scan complete — %d suspect photo%s found in %d filename group%s.\n\n'
-             .. 'Reasons flagged:\n%s\n\n'
+                'Scan complete — %d suspect photo%s found.\n\n'
+             .. '%d filename group%s contain the same filename but different\n'
+             .. 'capture dates, meaning these are different images that may\n'
+             .. 'have received each other\'s keywords.\n\n'
              .. 'Add the keyword  "keyword-suspect"  to all %d photo%s?',
                 #suspects, #suspects == 1 and '' or 's',
-                dupFilenames, dupFilenames == 1 and '' or 's',
-                table.concat(reasons, '\n'),
+                mixedGroups, mixedGroups == 1 and '' or 's',
                 #suspects, #suspects == 1 and '' or 's'),
             'Flag Suspects',
             'Cancel')
